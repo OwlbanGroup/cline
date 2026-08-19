@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import {
+	disableConnectorAutostart,
 	clearHubDiscovery,
 	ensureFileExists,
 	listActiveConnectors,
@@ -52,7 +53,7 @@ type SpawnedProcessRecord = {
 	detached?: boolean;
 };
 
-type DoctorStatus = {
+export type DoctorStatus = {
 	cwd: string;
 	cliVersion: string;
 	coreVersion?: string;
@@ -627,10 +628,119 @@ function killPids(pids: number[]): number {
 	return killed;
 }
 
+
+async function executeFixActions(
+	opts: { cwd: string },
+	beforeStatus: DoctorStatus,
+	io: DoctorIo,
+): Promise<{
+	killed: {
+		hubListeners: number;
+		staleHubDaemons: number;
+		cliProcesses: number;
+		sidecarProcesses: number;
+		connectorProcesses: number;
+		connectorSessions: number;
+		hubStartupLocks: number;
+		hubDiscovery: number;
+	};
+	statusAfterHubStop: DoctorStatus; // The status after all hub/stale process killing attempts
+	staleHubTargets: number[];
+	staleCliTargets: number[];
+	staleSidecarTargets: number[];
+	clearedArtifacts: { startupLocks: number; discovery: number };
+}> {
+	const killed = {
+		hubListeners: 0,
+		staleHubDaemons: 0,
+		cliProcesses: 0,
+		sidecarProcesses: 0,
+		connectorProcesses: 0,
+		connectorSessions: 0,
+		hubStartupLocks: 0,
+		hubDiscovery: 0,
+	};
+
+	// 1. Attempt graceful hub stop
+	const gracefullyStoppedHub = beforeStatus.hubHealthy
+		? await stopLocalHubServerGracefully(resolveCliHubOwnerContext()).catch(
+				() => false,
+			)
+		: false;
+
+	// Get status after graceful stop (or if not attempted)
+	let statusAfterHubStop = gracefullyStoppedHub
+		? await collectDoctorStatus(opts.cwd)
+		: beforeStatus;
+
+	// If graceful stop was not successful, explicitly kill remaining hub listeners
+	if (!gracefullyStoppedHub) {
+		killed.hubListeners = killPids(statusAfterHubStop.listeningPids);
+		// Re-collect status if listeners were killed to ensure accurate filtering for subsequent steps
+		if (killed.hubListeners > 0) {
+			statusAfterHubStop = await collectDoctorStatus(opts.cwd);
+		}
+	}
+
+	// 2. Kill stale hub daemons
+	const staleHubTargets = beforeStatus.staleHubPids.filter(
+		(pid) => !statusAfterHubStop.listeningPids.includes(pid),
+	);
+	killed.staleHubDaemons = killPids(staleHubTargets);
+
+	// 3. Kill stale CLI processes
+	const staleCliTargets = beforeStatus.staleCliPids.filter(
+		(pid) =>
+			!statusAfterHubStop.listeningPids.includes(pid) &&
+			!staleHubTargets.includes(pid),
+	);
+	killed.cliProcesses = killPids(staleCliTargets);
+
+	// 4. Kill stale sidecar processes
+	const staleSidecarTargets = beforeStatus.staleSidecarPids.filter(
+		(pid) =>
+			!statusAfterHubStop.listeningPids.includes(pid) &&
+			!staleHubTargets.includes(pid) &&
+			!staleCliTargets.includes(pid),
+	);
+	killed.sidecarProcesses = killPids(staleSidecarTargets);
+
+	// 5. Stop connectors
+	const stoppedConnectors = await stopAllConnectors({
+		writeln: () => {},
+		writeErr: () => {},
+	});
+	killed.connectorProcesses = stoppedConnectors.stoppedProcesses;
+	killed.connectorSessions = stoppedConnectors.stoppedSessions;
+
+	if (stoppedConnectors.executed > 0) {
+		disableConnectorAutostart();
+	}
+
+	// 6. Clear hub startup artifacts
+	const postConnectorStopStatus = await collectDoctorStatus(opts.cwd); // Get status after connector stop
+	const clearedArtifacts = await clearHubStartupArtifacts(opts.cwd, {
+		clearDiscovery:
+			!postConnectorStopStatus.hubHealthy && postConnectorStopStatus.listeningPids.length === 0,
+	});
+	killed.hubStartupLocks = clearedArtifacts.startupLocks;
+	killed.hubDiscovery = clearedArtifacts.discovery;
+
+	return {
+		killed,
+		statusAfterHubStop,
+		staleHubTargets,
+		staleCliTargets,
+		staleSidecarTargets,
+		clearedArtifacts,
+	};
+}
+
 export const __test__ = {
 	decideForeignContainer,
 	CONTAINER_CGROUP_PATTERN,
 	describeProcessesStartedDuringFix,
+	killPids,
 	formatSupervisedConnector,
 };
 
@@ -647,19 +757,28 @@ export async function runDoctorCommand(
 		if (jsonOutput) {
 			io.writeln(JSON.stringify(before));
 			return 0;
+		} else {
+			io.writeln(`${c.bold}--- CLI & Hub Status ---${c.reset}`);
+			writeln(`cli version ${c.dim}${before.cliVersion}${c.reset}`);
+			writeln(`core version ${c.dim}${before.coreVersion ?? "n/a"}${c.reset}`);
+			writeln(`hub url ${c.dim}${before.hubUrl ?? "none"}${c.reset}`);
+			writeln(
+				`hub healthy ${c.dim}${before.hubHealthy ? "yes" : "no"}${before.hubPid ? ` (pid=${before.hubPid})` : ""}${c.reset}`,
+			);
+			writeln(`hub uptime ${c.dim}${before.hubUptime ?? "n/a"}${c.reset}`);
+			io.writeln();
+
+			io.writeln(`${c.bold}--- Process Overview ---${c.reset}`);
+			writeln(formatPidList("hub listeners", before.listeningPids));
+			writeln(formatDaemonPidList("stale hub daemons", before.staleHubPids));
+			writeln(formatStartupLockList("hub startup locks", before.hubStartupLocks));
+			writeln(formatPidList("cli processes", before.staleCliPids));
+			writeln(formatPidList("sidecar processes", before.staleSidecarPids));
+			io.writeln();
+
+			io.writeln(`${c.bold}--- Connectors ---${c.reset}`);
 		}
-		writeln(`cli version ${c.dim}${before.cliVersion}${c.reset}`);
-		writeln(`core version ${c.dim}${before.coreVersion ?? "n/a"}${c.reset}`);
-		writeln(`hub url ${c.dim}${before.hubUrl ?? "none"}${c.reset}`);
-		writeln(
-			`hub healthy ${c.dim}${before.hubHealthy ? "yes" : "no"}${before.hubPid ? ` (pid=${before.hubPid})` : ""}${c.reset}`,
-		);
-		writeln(`hub uptime ${c.dim}${before.hubUptime ?? "n/a"}${c.reset}`);
-		writeln(formatPidList("hub listeners", before.listeningPids));
-		writeln(formatDaemonPidList("stale hub daemons", before.staleHubPids));
-		writeln(formatStartupLockList("hub startup locks", before.hubStartupLocks));
-		writeln(formatPidList("cli processes", before.staleCliPids));
-		writeln(formatPidList("sidecar processes", before.staleSidecarPids));
+
 		if (before.activeConnectors.length === 0) {
 			writeln(`active connectors ${c.dim}0${c.reset}`);
 		} else {
@@ -668,23 +787,31 @@ export async function runDoctorCommand(
 				writeln(`- ${c.dim}${formatActiveConnector(record)}${c.reset}`);
 			}
 		}
-		if (before.supervisedConnectors?.length) {
+		if (before.supervisedConnectors === undefined) {
+			writeln(`hub-supervised connectors: ${c.dim}n/a (hub not running or too old)${c.reset}`);
+		} else if (before.supervisedConnectors.length > 0) {
 			writeln("hub-supervised connectors:");
 			for (const record of before.supervisedConnectors) {
 				writeln(`- ${c.dim}${formatSupervisedConnector(record)}${c.reset}`);
 			}
+		} else {
+			writeln(`hub-supervised connectors ${c.dim}0${c.reset}`);
 		}
 		if (verbose && before.recentSpawnedProcesses.length > 0) {
+			io.writeln();
+			io.writeln(`${c.bold}--- Recent Activity ---${c.reset}`);
 			writeln("recent spawned processes:");
 			for (const record of before.recentSpawnedProcesses) {
 				writeln(`- ${c.dim}${formatRecentSpawnedProcess(record)}${c.reset}`);
 			}
+			io.writeln();
 		}
 		if (
 			before.listeningPids.length > 0 ||
 			before.staleHubPids.length > 0 ||
 			before.staleCliPids.length > 0 ||
 			before.staleSidecarPids.length > 0
+			// No empty line here, as the recommendation is often the last thing.
 		) {
 			io.writeln(
 				"\nRun `cline doctor fix` to kill all stale local processes, including stale sidecars.",
@@ -693,43 +820,15 @@ export async function runDoctorCommand(
 		return 0;
 	}
 
-	const gracefullyStoppedHub = before.hubHealthy
-		? await stopLocalHubServerGracefully(resolveCliHubOwnerContext()).catch(
-				() => false,
-			)
-		: false;
-	const refreshedAfterGracefulStop = gracefullyStoppedHub
-		? await collectDoctorStatus(opts.cwd)
-		: before;
-	const killedHub = gracefullyStoppedHub
-		? 0
-		: killPids(refreshedAfterGracefulStop.listeningPids);
-	const staleHubTargets = before.staleHubPids.filter(
-		(pid) => !refreshedAfterGracefulStop.listeningPids.includes(pid),
-	);
-	const killedStaleHubs = killPids(staleHubTargets);
-	const staleCliTargets = before.staleCliPids.filter(
-		(pid) =>
-			!refreshedAfterGracefulStop.listeningPids.includes(pid) &&
-			!staleHubTargets.includes(pid),
-	);
-	const killedCli = killPids(staleCliTargets);
-	const staleSidecarTargets = before.staleSidecarPids.filter(
-		(pid) =>
-			!refreshedAfterGracefulStop.listeningPids.includes(pid) &&
-			!staleHubTargets.includes(pid) &&
-			!staleCliTargets.includes(pid),
-	);
-	const killedSidecars = killPids(staleSidecarTargets);
-	const stoppedConnectors = await stopAllConnectors({
-		writeln: () => {},
-		writeErr: () => {},
-	});
-	const postKillStatus = await collectDoctorStatus(opts.cwd);
-	const clearedArtifacts = await clearHubStartupArtifacts(opts.cwd, {
-		clearDiscovery:
-			!postKillStatus.hubHealthy && postKillStatus.listeningPids.length === 0,
-	});
+	const {
+		killed,
+		statusAfterHubStop,
+		staleHubTargets,
+		staleCliTargets,
+		staleSidecarTargets,
+		clearedArtifacts,
+	} = await executeFixActions(opts, before, io);
+
 	const after = await collectDoctorStatus(opts.cwd);
 
 	if (jsonOutput) {
@@ -737,37 +836,31 @@ export async function runDoctorCommand(
 			JSON.stringify({
 				before,
 				after,
-				killed: {
-					hubListeners: killedHub,
-					staleHubDaemons: killedStaleHubs,
-					cliProcesses: killedCli,
-					sidecarProcesses: killedSidecars,
-					connectorProcesses: stoppedConnectors.stoppedProcesses,
-					connectorSessions: stoppedConnectors.stoppedSessions,
-					hubStartupLocks: clearedArtifacts.startupLocks,
-					hubDiscovery: clearedArtifacts.discovery,
-				},
+				killed,
 			}),
 		);
 		return 0;
 	}
-	writeln(`killed hub listeners ${c.dim}${killedHub}${c.reset}`);
-	writeln(`killed stale hub daemons ${c.dim}${killedStaleHubs}${c.reset}`);
-	writeln(`killed cli processes ${c.dim}${killedCli}${c.reset}`);
-	writeln(`killed sidecar processes ${c.dim}${killedSidecars}${c.reset}`);
+	io.writeln(`${c.bold}--- Fix Summary ---${c.reset}`);
+	writeln(`Killed hub listeners: ${c.dim}${killed.hubListeners}${c.reset}`);
+	writeln(`Killed stale hub daemons: ${c.dim}${killed.staleHubDaemons}${c.reset}`);
+	writeln(`Killed CLI processes: ${c.dim}${killed.cliProcesses}${c.reset}`);
+	writeln(`Killed sidecar processes: ${c.dim}${killed.sidecarProcesses}${c.reset}`);
 	writeln(
-		`stopped connector processes ${c.dim}${stoppedConnectors.stoppedProcesses}${c.reset}`,
+		`Stopped connector processes: ${c.dim}${stoppedConnectors.stoppedProcesses}${c.reset}`,
 	);
 	writeln(
-		`stopped connector sessions ${c.dim}${stoppedConnectors.stoppedSessions}${c.reset}`,
+		`Stopped connector sessions: ${c.dim}${stoppedConnectors.stoppedSessions}${c.reset}`,
 	);
 	writeln(
-		`cleared hub startup locks ${c.dim}${clearedArtifacts.startupLocks}${c.reset}`,
+		`Cleared hub startup locks: ${c.dim}${clearedArtifacts.startupLocks}${c.reset}`,
 	);
 	writeln(
-		`cleared hub discovery records ${c.dim}${clearedArtifacts.discovery}${c.reset}`,
+		`Cleared hub discovery records: ${c.dim}${clearedArtifacts.discovery}${c.reset}`,
 	);
-	writeln(`hub healthy after fix: ${after.hubHealthy ? "yes" : "no"}`);
+	writeln(`Hub healthy after fix: ${after.hubHealthy ? "yes" : "no"}`);
+	io.writeln();
+
 	// "Remaining" means a process this run tried to kill and failed to. A
 	// re-scan alone cannot tell that apart from a process that appeared while
 	// the fix was running, and reporting the two together reads as a failure
@@ -776,10 +869,12 @@ export async function runDoctorCommand(
 		remaining.filter((pid) => targets.includes(pid));
 	const appeared = (targets: number[], remaining: number[]) =>
 		remaining.filter((pid) => !targets.includes(pid));
+
+	io.writeln(`${c.bold}--- Remaining Processes ---${c.reset}`);
 	writeln(
 		formatPidList(
-			"remaining hub listeners",
-			survived(refreshedAfterGracefulStop.listeningPids, after.listeningPids),
+			"remaining hub listeners", // Use statusAfterHubStop for comparison
+			survived(statusAfterHubStop.listeningPids, after.listeningPids),
 		),
 	);
 	writeln(

@@ -8,7 +8,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi, beforeEach } from "vitest";
 import { version as cliVersion } from "../../package.json";
 import { getCliBuildInfo } from "../utils/common";
 
@@ -25,6 +25,10 @@ const {
 	mockEnsureFileExists,
 	mockListActiveConnectors,
 	mockStopAllConnectors,
+	mockDisableConnectorAutostart,
+	mockCollectDoctorStatus,
+	mockClearHubStartupArtifacts,
+	mockKillPids,
 	mockListSupervisedConnectors,
 } = vi.hoisted(() => ({
 	mockSpawnSync: vi.fn(),
@@ -61,6 +65,9 @@ const {
 		stoppedSessions: 0,
 		executed: 0,
 	})),
+	mockCollectDoctorStatus: vi.fn(),
+	mockClearHubStartupArtifacts: vi.fn(),
+	mockDisableConnectorAutostart: vi.fn(),
 	mockListSupervisedConnectors: vi.fn(async () => undefined as unknown),
 }));
 
@@ -72,18 +79,27 @@ vi.mock("@cline/core", () => ({
 	resolveClineDataDir: mockResolveClineDataDir,
 	resolveProductionHubOwnerContext: mockResolveProductionHubOwnerContext,
 	resolveSharedHubOwnerContext: mockResolveSharedHubOwnerContext,
-	clearHubDiscovery: mockClearHubDiscovery,
 	probeHubServer: mockProbeHubServer,
 	readHubDiscovery: mockReadHubDiscovery,
 	readSupersededHubDiscovery: mockReadSupersededHubDiscovery,
 	stopLocalHubServerGracefully: mockStopLocalHubServerGracefully,
 	ensureFileExists: mockEnsureFileExists,
 	listActiveConnectors: mockListActiveConnectors,
+	disableConnectorAutostart: mockDisableConnectorAutostart,
 }));
 
 vi.mock("../connectors/common", () => ({
 	isProcessRunning: vi.fn(() => false),
 }));
+vi.mock("./doctor", async (importOriginal: typeof vi.importActual) => {
+	const actual = await importOriginal<typeof import("./doctor")>();
+	return {
+		...actual,
+		collectDoctorStatus: mockCollectDoctorStatus,
+		clearHubStartupArtifacts: mockClearHubStartupArtifacts,
+		__test__: { ...actual.__test__, killPids: mockKillPids },
+	};
+});
 
 vi.mock("./connect", () => ({
 	stopAllConnectors: mockStopAllConnectors,
@@ -98,8 +114,12 @@ import { __test__, createDoctorCommand, runDoctorCommand } from "./doctor";
 describe("runDoctorCommand", () => {
 	const tempDirs: string[] = [];
 
-	afterEach(() => {
-		vi.clearAllMocks();
+	let killSpy: vi.SpyInstance;
+
+	beforeEach(() => {
+		// Set up spies and default mock implementations before each test
+		killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
+
 		mockResolveClineDataDir.mockReturnValue("/tmp/cline-data");
 		mockResolveProductionHubOwnerContext.mockReturnValue({
 			ownerId: "hub-production",
@@ -117,6 +137,12 @@ describe("runDoctorCommand", () => {
 			stoppedSessions: 0,
 			executed: 0,
 		});
+	});
+
+	afterEach(() => {
+		// Restore any mocked/spied functions and clear temp directories
+		vi.restoreAllMocks();
+
 		for (const dir of tempDirs.splice(0)) {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -402,7 +428,6 @@ describe("runDoctorCommand", () => {
 			}
 			return { status: 1, stdout: "" };
 		});
-		const killSpy = vi.spyOn(process, "kill").mockImplementation(() => true);
 
 		const output: string[] = [];
 		const code = await runDoctorCommand(
@@ -425,7 +450,40 @@ describe("runDoctorCommand", () => {
 				sidecarProcesses: 1,
 			},
 		});
-		killSpy.mockRestore();
+	});
+
+	it("doctor --fix disables connector autostart when connectors are stopped", async () => {
+		const cwd = "/workspace";
+		mockReadHubDiscovery.mockResolvedValue(undefined);
+		mockProbeHubServer.mockResolvedValue(undefined);
+		mockSpawnSync.mockReturnValue({ status: 1, stdout: "" });
+		mockStopAllConnectors.mockResolvedValue({
+			stoppedProcesses: 1,
+			failedProcesses: 0,
+			stoppedSessions: 2,
+			executed: 1, // Ensure connectors were "executed" (stopped)
+		});
+
+		const output: string[] = [];
+		const code = await runDoctorCommand(
+			{ cwd, json: true, fix: true },
+			{
+				writeln: (text) => {
+					output.push(text ?? "");
+				},
+				writeErr: () => {},
+			},
+		);
+
+		expect(code).toBe(0);
+		expect(mockStopAllConnectors).toHaveBeenCalledTimes(1);
+		expect(mockDisableConnectorAutostart).toHaveBeenCalledTimes(1);
+		expect(JSON.parse(output[0] || "")).toMatchObject({
+			killed: {
+				connectorProcesses: 1,
+				connectorSessions: 2,
+			},
+		});
 	});
 });
 
@@ -599,7 +657,7 @@ describe("container-aware process filtering", () => {
 describe("doctor supervision reporting", () => {
 	const { formatSupervisedConnector } = __test__;
 
-	afterEach(() => {
+	beforeEach(() => {
 		vi.clearAllMocks();
 		mockListSupervisedConnectors.mockResolvedValue(undefined);
 	});
