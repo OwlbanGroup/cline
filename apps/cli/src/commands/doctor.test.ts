@@ -86,6 +86,7 @@ vi.mock("@cline/core", () => ({
 	ensureFileExists: mockEnsureFileExists,
 	listActiveConnectors: mockListActiveConnectors,
 	disableConnectorAutostart: mockDisableConnectorAutostart,
+	clearHubDiscovery: mockClearHubDiscovery,
 }));
 
 vi.mock("../connectors/common", () => ({
@@ -408,7 +409,7 @@ describe("runDoctorCommand", () => {
 		});
 	});
 
-	it("doctor --fix kills stale code sidecar processes", async () => {
+	(process.platform === "win32" ? it.skip : it)("doctor --fix kills stale code sidecar processes", async () => {
 		const cwd = "/workspace";
 		mockReadHubDiscovery.mockResolvedValue(undefined);
 		mockProbeHubServer.mockResolvedValue(undefined);
